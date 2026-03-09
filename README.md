@@ -1,249 +1,231 @@
-# Privacy-Preserving Edge-Based Remote Patient Vital Monitoring System
+
+# AI-Enhanced Edge-Based Remote Patient Monitoring System
 
 ⚠️ **Project Status: In Development**
 
-This repository currently contains the **system design, hardware configuration, and implementation plan** for an edge-based patient monitoring system.  
-The **AI anomaly detection models, system evaluation, and experimental results are still under development** and will be added in future updates.
+This repository contains the implementation of a **privacy-preserving edge-based remote patient monitoring system** running on a **Raspberry Pi 5**.
+
+The system integrates physiological sensors, edge-based machine learning, and a local alert system to detect abnormal patient conditions in real time.
+
+Initial development used **threshold-based rules** to validate the sensing pipeline. The system has now been extended with **machine learning models running locally on the Raspberry Pi**.
 
 ---
 
-# Overview
+# Project Overview
 
-This project implements a **privacy-preserving edge-based remote patient monitoring (RPM) system** using a **Raspberry Pi 5**.
+Remote patient monitoring systems often rely on cloud processing to analyse physiological data. This introduces several challenges:
 
-The system collects physiological signals from sensors, processes the data locally on the edge device, detects abnormal conditions, and triggers **real-time alerts using LEDs and a buzzer**.
+- network dependency
+- higher latency
+- potential privacy risks
+- increased bandwidth usage
 
-Unlike traditional monitoring systems that rely heavily on cloud infrastructure, this project adopts an **edge-first architecture** where critical data processing occurs locally.
+This project explores an **edge computing approach**, where physiological signals are analysed directly on the Raspberry Pi.
 
-Processing data directly on the edge device improves:
+By performing analytics at the edge, the system can:
 
-- **Latency** – faster detection of abnormal conditions  
-- **Privacy** – sensitive patient data remains on the local device  
-- **Reliability** – the system continues operating during network outages  
-
-Edge computing has been identified as a promising approach for healthcare applications that require **low latency and secure handling of physiological data**.
-
----
-
-# Problem Statement
-
-Many existing remote patient monitoring systems rely on **cloud-centric architectures**, where raw physiological data is continuously transmitted to remote servers for analysis.
-
-This approach introduces several challenges:
-
-- **Latency** – delays in detecting abnormal health conditions
-- **Network dependency** – monitoring fails during internet disruptions
-- **Privacy risks** – sensitive patient data must traverse external networks
-- **Bandwidth consumption** – constant data transmission increases network load
-
-These issues become especially critical for **elderly patients or individuals with chronic health conditions**, where delayed alerts may impact patient safety.
-
-There is therefore a need for a **monitoring system capable of detecting health anomalies locally while reducing reliance on continuous cloud connectivity**.
-
----
-
-# Motivation and Importance
-
-Remote patient monitoring systems are becoming increasingly important in modern healthcare, particularly in home-based care and telemedicine.
-
-The global RPM market has been growing rapidly due to the increasing adoption of **telehealth and remote care technologies**.
-
-However, concerns about:
-
-- **data privacy**
-- **system reliability**
-- **network dependency**
-
-remain major barriers to adoption.
-
-Edge computing provides a potential solution by allowing physiological data to be processed **closer to where it is generated**, improving responsiveness and reducing exposure of sensitive health information.
-
-This project explores how **edge computing can be used to improve reliability, privacy, and responsiveness in healthcare monitoring systems**.
-
----
-
-# Project Goals
-
-The primary goals of this project are:
-
-1. Design and implement an edge-based remote patient monitoring system
-2. Process physiological sensor data locally on a Raspberry Pi
-3. Detect abnormal health conditions in real time
-4. Trigger local alerts without relying on cloud connectivity
-5. Reduce transmission of sensitive health data
-6. Evaluate system performance in terms of latency, bandwidth usage, and reliability
-
-These goals aim to demonstrate the feasibility of **edge-based healthcare monitoring systems**.
+- reduce latency
+- preserve patient privacy
+- operate without continuous internet connectivity
+- trigger immediate local alerts
 
 ---
 
 # System Architecture
 
-The system follows a **three-layer architecture** consisting of a sensing layer, edge processing layer, and an optional cloud layer.
+The system follows a **multi-layer edge architecture**:
 
-## 1. Sensing Layer
+Sensors → Feature Extraction → AI Models → Alert System
 
-The sensing layer collects physiological signals from sensors connected to the Raspberry Pi.
+### Sensing Layer
 
-Sensors used include:
+The Raspberry Pi collects data from multiple sources:
 
-- **MAX30102** – measures heart rate and blood oxygen saturation (SpO₂)
-- **DHT22** – measures environmental temperature
+| Sensor | Purpose |
+|------|------|
+| MAX30102 | PPG signal for heart rate detection |
+| DHT22 | Ambient temperature monitoring |
 
-These sensors generate continuous physiological data streams that are sent to the edge device for processing.
-
----
-
-## 2. Edge Processing Layer (Raspberry Pi)
-
-The **Raspberry Pi 5 acts as the edge computing device** responsible for:
-
-- sensor data acquisition  
-- signal preprocessing  
-- feature extraction  
-- anomaly detection  
-- local alert generation  
-- local data buffering  
-
-When abnormal readings are detected, the Raspberry Pi triggers:
-
-- LED indicators
-- a buzzer alarm
-
-This ensures that alerts can be generated **immediately without relying on external servers**.
-
-The edge device therefore serves as the **core decision-making unit of the monitoring system**.
+These sensors provide **physiological and environmental context** for anomaly detection.
 
 ---
 
-## 3. Cloud Layer (Optional)
+### Edge Analytics Layer
 
-The cloud layer is optional and is used primarily for:
+All analytics are performed **directly on the Raspberry Pi**.
 
-- long-term storage of summarized health data
-- visualization dashboards
-- clinician monitoring
+The system uses a **two-stage AI pipeline** to improve reliability and reduce false alarms.
 
-Only **summarized or non-sensitive data** is transmitted to the cloud to minimize privacy risks and reduce bandwidth usage.
+#### Stage 1 — Contact Quality Classification
 
----
+A machine learning classifier determines whether the sensor reading represents **valid physiological contact**.
 
-# Hardware Setup
+Possible classes include:
 
-The system uses a Raspberry Pi as the edge computing platform connected to sensors and alert devices.
+- good_contact
+- poor_contact
+- motion_artifact
+- finger_off
 
-## Components
-
-- Raspberry Pi 5
-- MAX30102 Heart Rate Sensor
-- DHT22 Temperature Sensor
-- 3 Status LEDs (Green / Yellow / Red)
-- Buzzer
-- Resistors
-- Jumper wires
+This prevents invalid signals from triggering health alerts.
 
 ---
 
-# Wiring Diagram
+#### Stage 2 — Anomaly Detection
 
-![Hardware Wiring](docs/wiring_diagram.png)
+If good contact is detected, the system evaluates physiological patterns to determine whether the readings are abnormal.
 
----
+Features used for anomaly detection include:
 
-## Sensor Connections
+- AC/DC ratio of the PPG signal
+- peak-to-peak amplitude
+- signal stability
+- heart rate variability
+- temperature change
 
-### DHT22 Temperature Sensor
-
-| DHT22 Pin | Raspberry Pi |
-|-----------|--------------|
-| VCC | 5V |
-| GND | GND |
-| DATA | GPIO 4 |
-
-The DHT22 sensor measures ambient temperature to provide environmental context for monitoring.
+A lightweight **MLP classifier** is used for anomaly detection.
 
 ---
 
-### MAX30102 Heart Rate Sensor
+### Alert Layer
 
-The MAX30102 communicates with the Raspberry Pi via **I²C**.
+When an abnormal condition persists, the system triggers a local alert using LEDs and a buzzer.
 
-| MAX30102 Pin | Raspberry Pi |
-|---------------|--------------|
-| VIN | 3.3V |
-| GND | GND |
-| SDA | GPIO 2 |
-| SCL | GPIO 3 |
+| Status | Indicator |
+|------|------|
+| Normal | Green LED |
+| Warning | Yellow LED |
+| Critical | Red LED + Buzzer |
 
-This sensor measures:
-
-- heart rate
-- blood oxygen levels
+A **persistence gate** ensures anomalies must persist for several seconds before an alert is raised.
 
 ---
 
-## Alert System
+# Project Workflow
 
-The system includes a **local alert mechanism** using LEDs and a buzzer.
+The project pipeline consists of four main stages.
 
-| Component | GPIO | Function |
-|-----------|------|----------|
-| Green LED | GPIO 17 | Normal status |
-| Yellow LED | GPIO 27 | Warning |
-| Red LED | GPIO 22 | Critical alert |
-| Buzzer | GPIO 23 | Audio alarm |
+## 1. Data Collection
 
-Local alerts ensure that warnings are triggered **even when network connectivity is unavailable**.
+Training data is collected using:
+
+data_logger.py
+
+This script reads sensor data and stores labelled samples for different contact conditions.
+
+Example:
+
+python data_logger.py --label good_contact --duration 120  
+python data_logger.py --label finger_off --duration 90  
+python data_logger.py --label poor_contact --duration 90  
+python data_logger.py --label motion_artifact --duration 90
+
+The collected data is stored in:
+
+training_data/
 
 ---
 
-# Design Considerations
+## 2. Model Training
 
-Several approaches were considered for anomaly detection.
+Two machine learning models are trained from the collected data.
 
-| Approach | Latency | Power Usage | Feasibility |
-|----------|---------|-------------|-------------|
-| Deep Learning Model | High | High | Not suitable |
-| Machine Learning Classifier | Medium | Medium | Possible future work |
-| Threshold-Based Detection | Low | Very Low | Selected |
+### Contact Classifier
 
-Threshold-based logic was selected because it provides **low computational overhead and fast response time**, making it suitable for deployment on a Raspberry Pi.
+train_contact_classifier.py
+
+This model classifies signal quality.
+
+### Anomaly Detection Model
+
+train_anomaly_mlp.py
+
+This model detects abnormal physiological patterns.
+
+Both models are exported to the **models/** directory for deployment.
+
+---
+
+## 3. Edge Deployment
+
+The monitoring system runs on the Raspberry Pi using:
+
+python main_ai.py
+
+At runtime the system:
+
+1. reads sensor signals  
+2. extracts features  
+3. evaluates contact quality  
+4. performs anomaly detection  
+5. triggers alerts if necessary  
+
+All processing occurs **locally on the Raspberry Pi**.
+
+---
+
+# Hardware Components
+
+| Component | Purpose |
+|------|------|
+| Raspberry Pi 5 | Edge computing device |
+| MAX30102 | Heart rate and PPG sensor |
+| DHT22 | Temperature sensor |
+| LEDs | Status indicators |
+| Buzzer | Alert notification |
+
+---
+
+# Edge AI Design Considerations
+
+The system was designed with edge deployment constraints in mind:
+
+- lightweight machine learning models
+- minimal latency
+- low power consumption
+- minimal cloud dependency
+
+Initial rule-based thresholds were used to validate the sensing pipeline before transitioning to machine learning models.
 
 ---
 
 # Evaluation Plan
 
-The system will be evaluated based on:
+The system will be evaluated using the following metrics:
 
-- **Alert latency** (sensor reading → alert trigger)
-- **Bandwidth usage reduction**
-- **System resilience during network disruptions**
-- **Power consumption of the edge device**
-
-These metrics will be used to evaluate the effectiveness of the edge-based monitoring system.
-
----
-
-# Expected Outcomes
-
-The project aims to demonstrate that edge-based monitoring systems can:
-
-- detect abnormal health conditions in real time
-- reduce reliance on cloud infrastructure
-- preserve patient privacy
-- maintain monitoring functionality during connectivity failures
-- reduce network bandwidth usage
-
-The final output will be a **functional prototype of an edge-based remote patient monitoring system**.
+| Metric | Description |
+|------|------|
+| Detection latency | Time from sensor reading to alert |
+| False positive rate | Alerts triggered during normal conditions |
+| Model accuracy | Classification accuracy on validation data |
+| System resilience | Operation during network disconnection |
 
 ---
 
 # Future Work
 
-Possible extensions include:
+Planned improvements include:
 
-- machine learning-based anomaly detection
-- predictive health analytics
-- multi-patient monitoring systems
-- secure cloud dashboards
-- integration with healthcare platforms
+- dashboard for visualising sensor data and AI predictions
+- expanded training dataset
+- model optimisation for edge inference
+- additional physiological sensors
+- improved anomaly detection models
+
+---
+
+# Repository Structure
+
+.
+├── data_logger.py  
+├── train_contact_classifier.py  
+├── train_anomaly_mlp.py  
+├── main_ai.py  
+├── training_data/  
+└── models/
+
+---
+
+# Project Goals
+
+This project aims to demonstrate that **edge-based AI systems can provide reliable real-time monitoring while preserving privacy and reducing dependence on cloud infrastructure.**
