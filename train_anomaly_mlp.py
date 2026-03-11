@@ -182,17 +182,23 @@ def load_and_engineer(data_dir: str = "training_data"):
     base_cols = ["timestamp", "ir_raw", "ac_dc_ratio", "peak_to_peak", "t_room", "hr"]
     df = _coerce_numeric(df, [c for c in base_cols if c in df.columns])
 
-    # Startup trim: remove first N rows per session (HR not yet stable)
+    # Startup trim: remove first N rows per session (HR not yet stable).
+    # NOTE: We avoid groupby().apply().reset_index(drop=True) for the trim step
+    # because pandas 2.x can drop the grouping column ('source_file') from the
+    # result when group_keys=False is combined with reset_index(drop=True).
+    # Instead we use a plain list-concat approach which is version-safe.
     before = len(df)
-    df = (df.groupby("source_file", group_keys=False)
-            .apply(lambda g: g.iloc[STARTUP_TRIM_ROWS:])
-            .reset_index(drop=True))
+    trimmed = []
+    for _, g in df.groupby("source_file", sort=False):
+        trimmed.append(g.iloc[STARTUP_TRIM_ROWS:])
+    df = pd.concat(trimmed, ignore_index=True)
     print(f"[TRAIN] Startup trim: {before} → {len(df)} rows "
           f"(removed {before - len(df)} unstable-HR rows)")
 
-    df = (df.groupby("source_file", group_keys=False)
-            .apply(per_file_engineering)
-            .reset_index(drop=True))
+    engineered = []
+    for _, g in df.groupby("source_file", sort=False):
+        engineered.append(per_file_engineering(g))
+    df = pd.concat(engineered, ignore_index=True)
     df = _coerce_numeric(df, FEATURE_COLS)
 
     df["binary_label"] = df["label"].apply(
