@@ -1,0 +1,30 @@
+{
+  "grouped_cv_fold_accuracies": [
+    1.0,
+    0.9772727272727273,
+    1.0,
+    1.0,
+    0.9090909090909091
+  ],
+  "grouped_cv_mean_accuracy": 0.9772727272727273,
+  "grouped_cv_std_accuracy": 0.03520893951097653,
+  "n_total_windows": 217,
+  "feature_count": 99,
+  "labels": {
+    "0": "finger_off",
+    "1": "good_contact",
+    "2": "motion_artifact",
+    "3": "poor_contact"
+  },
+  "startup_trim_rows": 150,
+  "used_channels": [
+    "ir_raw",
+    "red_raw",
+    "ac_dc_ratio",
+    "peak_to_peak",
+    "t_room",
+    "hr",
+    "hr_std_5s",
+    "spo2_est"
+  ]
+}

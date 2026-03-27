@@ -14,6 +14,7 @@ from sklearn.metrics import (accuracy_score, classification_report,
                               confusion_matrix)
 from sklearn.model_selection import StratifiedKFold, train_test_split, cross_val_score
 from sklearn.pipeline import Pipeline
+from sklearn.model_selection import GroupKFold
 
 warnings.filterwarnings("ignore", category=UserWarning)
 os.makedirs("models", exist_ok=True)
@@ -39,11 +40,13 @@ LABEL_NORMALIZATION = {
 
 PREFERRED_FEATURE_COLS = [
     "ir_raw",
+    "red_raw",
     "ac_dc_ratio",
     "peak_to_peak",
     "t_room",
     "hr",
     "hr_std_5s",
+    "spo2_est",
 ]
 
 
@@ -124,7 +127,7 @@ def build_window_table(
     Current: ~122 windows from 4 sessions.
     Target:  ~300+ windows after data collection above.
     """
-    step = window_size // 2
+    step = window_size
     rows = []
     labels = []
 
@@ -181,15 +184,27 @@ def build_window_table(
             p2p  = pd.to_numeric(w["peak_to_peak"], errors="coerce").fillna(0).values
             ir   = (pd.to_numeric(w["ir_raw"], errors="coerce").fillna(0).values
                     if "ir_raw" in w.columns else np.zeros(len(w), dtype=float))
+            red  = (pd.to_numeric(w["red_raw"], errors="coerce").fillna(0).values
+                    if "red_raw" in w.columns else np.zeros(len(w), dtype=float))
 
             feat["nonzero_ir_fraction"] = float(np.mean(ir > 0))
             feat["acdc_over_p2p_mean"]  = float(np.mean(acdc / (p2p + 1e-6)))
             feat["p2p_over_ir_mean"]    = float(np.mean(p2p / (np.abs(ir) + 1e-6)))
 
+            feat["red_ir_ratio_mean"] = float(np.mean(red / (ir + 1e-6)))
+            feat["red_ir_ratio_std"]  = float(np.std(red / (ir + 1e-6)))
+            feat["red_nonzero_fraction"] = float(np.mean(red > 0))
+
             if "hr" in w.columns:
                 hr = pd.to_numeric(w["hr"], errors="coerce").fillna(0).values
                 feat["nonzero_hr_fraction"] = float(np.mean(hr > 0))
                 feat["hr_over_ir_mean"]     = float(np.mean(hr / (np.abs(ir) + 1e-6)))
+
+            if "spo2_est" in w.columns:
+                spo2 = pd.to_numeric(w["spo2_est"], errors="coerce").fillna(0).values
+                feat["nonzero_spo2_fraction"]  = float(np.mean(spo2 > 0))
+                feat["valid_spo2_fraction"]    = float(np.mean((spo2 >= 70) & (spo2 <= 100)))
+                feat["spo2_below_90_fraction"] = float(np.mean(spo2 < 90))
 
             rows.append(feat)
             labels.append(majority_label)
@@ -208,130 +223,161 @@ def build_window_table(
     print(pd.Series(y).value_counts().to_string())
     return X_df, y
 
-
 # ==============================================================================
-# Main
+# Cross-file Validation
 # ==============================================================================
-def main():
-    df   = load_dataset()
-    X_df, y = build_window_table(df)
-
-    feature_cols = [c for c in X_df.columns
-                    if c not in {"source_file", "window_start", "window_end"}]
+def run_grouped_cross_file_validation(X_df: pd.DataFrame, y: np.ndarray, n_splits: int = 5):
+    feature_cols = [c for c in X_df.columns if c not in {"source_file", "window_start", "window_end"}]
     X = X_df[feature_cols].values
+    groups = X_df["source_file"].values
 
     label_names = sorted(pd.Series(y).astype(str).unique().tolist())
     label_to_id = {name: idx for idx, name in enumerate(label_names)}
     id_to_label = {idx: name for name, idx in label_to_id.items()}
-    y_enc       = np.array([label_to_id[v] for v in y], dtype=np.int32)
+    y_enc = np.array([label_to_id[v] for v in y], dtype=np.int32)
+
+    gkf = GroupKFold(n_splits=n_splits)
+
+    fold_accuracies = []
+    all_true = []
+    all_pred = []
+
+    for fold, (train_idx, val_idx) in enumerate(gkf.split(X, y_enc, groups=groups), start=1):
+        X_train, X_val = X[train_idx], X[val_idx]
+        y_train, y_val = y_enc[train_idx], y_enc[val_idx]
+
+        train_files = sorted(set(groups[train_idx]))
+        val_files = sorted(set(groups[val_idx]))
+
+        model = Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("clf", RandomForestClassifier(
+                n_estimators=200,
+                max_depth=12,
+                min_samples_split=4,
+                min_samples_leaf=2,
+                random_state=42,
+                n_jobs=-1,
+                class_weight="balanced_subsample",
+            )),
+        ])
+
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_val)
+
+        acc = accuracy_score(y_val, y_pred)
+        fold_accuracies.append(acc)
+
+        all_true.extend(y_val.tolist())
+        all_pred.extend(y_pred.tolist())
+
+        print(f"\n[FOLD {fold}] Accuracy: {acc:.4f}")
+        print(f"[FOLD {fold}] Train files ({len(train_files)}): {train_files}")
+        print(f"[FOLD {fold}] Val files ({len(val_files)}): {val_files}")
+
+    print("\n[GROUPED CV] Fold accuracies:")
+    for i, acc in enumerate(fold_accuracies, start=1):
+        print(f"  Fold {i}: {acc:.4f}")
+
+    print(f"\n[GROUPED CV] Mean accuracy: {np.mean(fold_accuracies):.4f}")
+    print(f"[GROUPED CV] Std accuracy:  {np.std(fold_accuracies):.4f}")
+
+    print("\n[GROUPED CV] Overall classification report:")
+    print(classification_report(
+        all_true,
+        all_pred,
+        target_names=[id_to_label[i] for i in sorted(id_to_label)],
+        zero_division=0,
+    ))
+
+    print("[GROUPED CV] Overall confusion matrix:")
+    print(confusion_matrix(all_true, all_pred))
+
+    return fold_accuracies, feature_cols
+    
+# ==============================================================================
+# Main
+# ==============================================================================
+def main():
+    # --------------------------------------------------------------------------
+    # Load ALL Stage 1 data together for grouped cross-file validation
+    # --------------------------------------------------------------------------
+    df_all = load_dataset("training_data_stage1_all")
+
+    # Build window-level dataset
+    X_df, y = build_window_table(df_all)
+
+    print("\n[TRAIN] Running grouped cross-file validation...")
+    fold_accuracies, feature_cols = run_grouped_cross_file_validation(
+        X_df, y, n_splits=5
+    )
+
+    # --------------------------------------------------------------------------
+    # Train final model on ALL available Stage 1 data after CV
+    # --------------------------------------------------------------------------
+    feature_cols = [c for c in X_df.columns
+                    if c not in {"source_file", "window_start", "window_end"}]
+
+    X_all = X_df[feature_cols].values
+
+    # Label encoding based on all labels
+    label_names = sorted(pd.Series(y).astype(str).unique().tolist())
+    label_to_id = {name: idx for idx, name in enumerate(label_names)}
+    id_to_label = {idx: name for name, idx in label_to_id.items()}
+    y_all_enc = np.array([label_to_id[v] for v in y], dtype=np.int32)
 
     with open("models/contact_label_map.json", "w") as f:
         json.dump(id_to_label, f, indent=2)
+
     print(f"\n[TRAIN] Classes: {id_to_label}")
-
-    # FIX: Warn when any class has too few windows for reliable cross-validation.
-    # With 5 folds and a minority class of <10 windows, some folds may contain
-    # zero examples of that class, producing misleadingly high CV scores.
-    min_class_count = pd.Series(y).value_counts().min()
-    min_class_name  = pd.Series(y).value_counts().idxmin()
-    if min_class_count < 10:
-        print(f"\n[WARN] Smallest class '{min_class_name}' has only "
-              f"{min_class_count} windows.")
-        print("[WARN] CV scores may be unreliable. Collect more data for this class.")
-    elif min_class_count < 20:
-        print(f"\n[NOTE] Smallest class '{min_class_name}' has {min_class_count} windows "
-              f"— aim for 20+ per class for robust CV.")
-
-    # ── 5-fold cross-validation ──────────────────────────────────────────────
-    cv_model = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("clf", RandomForestClassifier(
-            n_estimators=200, max_depth=12,
-            min_samples_split=4, min_samples_leaf=2,
-            random_state=42, n_jobs=-1,
-            class_weight="balanced_subsample",
-        )),
-    ])
-    print("\n[CV] Running 5-fold cross-validation...")
-    cv_scores = cross_val_score(
-        cv_model, X, y_enc,
-        cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=42),
-        scoring="accuracy",
-    )
-    print(f"[CV] Fold accuracies: {np.round(cv_scores, 4)}")
-    print(f"[CV] Mean: {cv_scores.mean():.4f}  Std: {cv_scores.std():.4f}")
-    if cv_scores.mean() >= 0.90:
-        print("[CV] ✓ Model genuinely generalises well.")
-    elif cv_scores.mean() >= 0.75:
-        print("[CV] ⚠ Moderate generalisation — collect more data per class.")
-    else:
-        print("[CV] ✗ Poor generalisation — more diverse data needed.")
-
-    # ── Final train/val split ────────────────────────────────────────────────
-    try:
-        X_tr, X_val, y_tr, y_val = train_test_split(
-            X_df[feature_cols], y_enc,
-            test_size=0.2, random_state=42, stratify=y_enc,
-        )
-    except ValueError:
-        print("[WARN] Stratified split failed; using random split.")
-        X_tr, X_val, y_tr, y_val = train_test_split(
-            X_df[feature_cols], y_enc,
-            test_size=0.2, random_state=42,
-        )
 
     final_model = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
         ("clf", RandomForestClassifier(
-            n_estimators=200, max_depth=12,
-            min_samples_split=4, min_samples_leaf=2,
-            random_state=42, n_jobs=-1,
+            n_estimators=200,
+            max_depth=12,
+            min_samples_split=4,
+            min_samples_leaf=2,
+            random_state=42,
+            n_jobs=-1,
             class_weight="balanced_subsample",
         )),
     ])
-    print("\n[TRAIN] Training final model on 80% split...")
-    final_model.fit(X_tr, y_tr)
 
-    y_pred  = final_model.predict(X_val)
-    val_acc = accuracy_score(y_val, y_pred)
-    cm      = confusion_matrix(y_val, y_pred).tolist()
+    print("\n[TRAIN] Training final model on ALL files...")
+    final_model.fit(X_all, y_all_enc)
 
-    print(f"\n[EVAL] Validation accuracy (single split): {val_acc:.4f}")
-    print("[EVAL] Classification report:")
-    print(classification_report(
-        y_val, y_pred,
-        target_names=[id_to_label[i] for i in sorted(id_to_label)],
-        zero_division=0,
-    ))
-    print("[EVAL] Confusion matrix:")
-    print(np.array(cm))
+    clf = final_model.named_steps["clf"]
+    importances = clf.feature_importances_
 
-    # Save bundle (Pipeline includes imputer — no separate imputer needed)
+    pairs = sorted(
+        zip(feature_cols, importances),
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    print("\nTop feature importances:")
+    for name, score in pairs[:15]:
+        print(f"{name}: {score:.4f}")
+
     bundle = {
-        "model":               final_model,
-        "feature_cols":        feature_cols,
-        "window_size":         PPG_WINDOW,
-        "label_map":           id_to_label,
+        "model": final_model,
+        "feature_cols": feature_cols,
+        "window_size": PPG_WINDOW,
+        "label_map": id_to_label,
         "label_normalization": LABEL_NORMALIZATION,
     }
     joblib.dump(bundle, "models/contact_model.pkl")
 
     metrics = {
-        "validation_accuracy":  float(val_acc),
-        "cv_mean_accuracy":     float(cv_scores.mean()),
-        "cv_std_accuracy":      float(cv_scores.std()),
-        "cv_fold_accuracies":   cv_scores.tolist(),
-        "n_windows":            int(len(X_df)),
-        "n_train":              int(len(X_tr)),
-        "n_val":                int(len(X_val)),
-        "feature_count":        int(len(feature_cols)),
-        "labels":               id_to_label,
-        "startup_trim_rows":    STARTUP_TRIM_ROWS,
-        "confusion_matrix":     cm,
-        "used_channels":        [c for c in PREFERRED_FEATURE_COLS
-                                 if c in df.columns],
-        "min_class_windows":    int(min_class_count),
-        "min_class_name":       str(min_class_name),
+        "grouped_cv_fold_accuracies": [float(a) for a in fold_accuracies],
+        "grouped_cv_mean_accuracy": float(np.mean(fold_accuracies)),
+        "grouped_cv_std_accuracy": float(np.std(fold_accuracies)),
+        "n_total_windows": int(len(X_df)),
+        "feature_count": int(len(feature_cols)),
+        "labels": id_to_label,
+        "startup_trim_rows": STARTUP_TRIM_ROWS,
+        "used_channels": [c for c in PREFERRED_FEATURE_COLS if c in df_all.columns],
     }
     with open("models/contact_metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
@@ -340,10 +386,9 @@ def main():
     print("  models/contact_model.pkl")
     print("  models/contact_label_map.json")
     print("  models/contact_metrics.json")
-    print(f"\n[SUMMARY] CV accuracy: {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
-    print(f"[SUMMARY] Single-split: {val_acc:.4f}")
-    print(f"[SUMMARY] Total windows: {len(X_df)} "
-          f"(target: 300+ for strong generalisation)")
+    print(f"\n[SUMMARY] Total windows: {len(X_df)}")
+    print(f"[SUMMARY] Grouped CV mean accuracy: {np.mean(fold_accuracies):.4f}")
+    print(f"[SUMMARY] Grouped CV std accuracy: {np.std(fold_accuracies):.4f}")
     print("[TRAIN] Done.")
 
 

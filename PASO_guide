@@ -1,0 +1,84 @@
+Here's how each PASO letter maps directly onto your system, with concrete actions for each.
+
+P — Profiling
+You need to measure before you optimise — otherwise you're guessing. Add this to your main loop to generate evidence for the rubric:
+pythonimport cProfile, pstats, io
+
+# Wrap a fixed number of cycles to profile
+pr = cProfile.Profile()
+pr.enable()
+# ... run 500 loop iterations ...
+pr.disable()
+s = io.StringIO()
+pstats.Stats(pr, stream=s).sort_stats('cumulative').print_stats(20)
+print(s.getvalue())
+For per-cycle timing, add these around your pipeline stages and log to eval_log.csv:
+pythont0 = time.perf_counter()
+# Stage 1 inference
+t_s1 = (time.perf_counter() - t0) * 1000
+
+t1 = time.perf_counter()
+# Stage 2 inference  
+t_s2 = (time.perf_counter() - t1) * 1000
+
+t2 = time.perf_counter()
+# safe_stats / feature extraction
+t_feat = (time.perf_counter() - t2) * 1000
+The profiling output is your evidence for the rubric — it proves you measured before optimising.
+
+A — Analysing
+Once you have numbers, you'll almost certainly find one of these three culprits:
+The DHT22 read is the most likely stall. It runs on the main thread with a blocking dht.temperature call, and it can take 20–50ms when the sensor hiccups. That's longer than your entire time.sleep(0.02) loop budget.
+safe_stats() is called every single cycle and computes 11 statistics across multiple arrays. On a Pi Zero/3, repeated np.percentile, np.polyfit, and np.std on 250-element arrays add up fast.
+The Isolation Forest decision_function() runs all estimators on every cycle. If your model was exported with the default 100 estimators, that's 100 tree traversals per loop.
+
+S — Scheduling
+This is the biggest win for your lag problem specifically. Move the DHT22 read off the main thread entirely:
+pythonimport threading
+
+_dht_lock  = threading.Lock()
+_dht_temp  = None
+
+def _dht_reader():
+    global _dht_temp
+    while True:
+        try:
+            t = dht.temperature
+            if t is not None:
+                with _dht_lock:
+                    _dht_temp = float(t)
+        except RuntimeError:
+            pass
+        time.sleep(2.0)
+
+threading.Thread(target=_dht_reader, daemon=True).start()
+
+# In main loop — non-blocking, just read the cached value:
+with _dht_lock:
+    amb_t = _dht_temp
+This means a slow DHT22 read never stalls the inference loop. The temperature value is always at most 2 seconds stale, which is fine since you're already using it as environmental context, not a real-time signal.
+Also add a scheduling gate — skip Stage 2 feature extraction entirely when contact_status != "GOOD", which you already do, but also skip safe_stats() and the full feature vector build on those cycles. Those are currently computed unconditionally every loop.
+
+O — Optimisation
+Three concrete optimisations for the rubric, ordered by effort:
+1. Float32 quantization on the feature pipeline — your safe_stats() already casts to float32 for the array, but the intermediate Python float() conversions and pd.DataFrame creation use float64. The bigger win is pre-allocating a numpy array instead of building a dict then a DataFrame every cycle:
+python# Instead of building a dict -> DataFrame every cycle,
+# pre-allocate a fixed-size array matching your feature_cols order
+feature_buffer = np.zeros(len(contact_feature_cols), dtype=np.float32)
+# Fill in-place, then pass directly to model.predict()
+2. Feature pruning using importances — after profiling, run this once on your trained model to identify which features matter:
+pythonimportances = contact_model.feature_importances_
+low_value = [contact_feature_cols[i] for i, v in enumerate(importances) if v < 0.005]
+print(f"Can drop {len(low_value)} features: {low_value}")
+Features below 0.5% importance contribute nothing to accuracy but cost compute every cycle. You can retrain with a reduced feature set, or just zero them out at inference time.
+3. Reduce Isolation Forest estimators — you don't need to retrain. When you export the model, prune it:
+python# Run this once, save the result as a new model file
+from sklearn.ensemble import IsolationForest
+model = anomaly_bundle["model"]
+# Trim to 20 estimators (was likely 100)
+model.estimators_ = model.estimators_[:20]
+model.estimators_features_ = model.estimators_features_[:20]
+model.n_estimators = 20
+import joblib
+joblib.dump({**anomaly_bundle, "model": model}, "models/stage2_anomaly_detector_fast.pkl")
+20 estimators on a well-trained Isolation Forest still gives reliable anomaly scores — you lose a little statistical robustness but gain ~5× inference speed for Stage 2.

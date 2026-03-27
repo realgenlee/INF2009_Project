@@ -1,0 +1,13 @@
+# backups
+backups/
+proj_env/
+*.pyc
+
+# logs
+*.log
+
+# old / unused stuff
+training_data(old)/
+main_ai_optimized1.py
+dashboard_log.csv
+eval_log.csv

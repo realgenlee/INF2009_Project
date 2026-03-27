@@ -1,0 +1,35 @@
+{
+  "train_dir": "training_data_stage2_train",
+  "val_dir": "training_data_stage2_val",
+  "n_train_normal_rows": 19857,
+  "n_val_normal_rows": 6570,
+  "score_threshold": -0.058259901453236326,
+  "target_normal_fpr": 0.05,
+  "estimated_val_normal_fpr": 0.050076103500761034,
+  "feature_cols": [
+    "ac_dc_ratio",
+    "peak_to_peak",
+    "p2p_cv",
+    "ac_dc_ratio_std",
+    "peak_to_peak_std",
+    "ir_std_5s",
+    "ir_slope",
+    "ir_drop",
+    "low_variation",
+    "hr",
+    "hr_std_5s",
+    "hr_valid",
+    "spo2_est",
+    "dt_room",
+    "t_room_std_5s"
+  ],
+  "startup_trim_rows": 150,
+  "normal_labels": [
+    "cold_temp",
+    "good_contact"
+  ],
+  "validation_anomaly_rate_by_label": {
+    "cold_temp": 0.06301369863013699,
+    "good_contact": 0.024200913242009132
+  }
+}

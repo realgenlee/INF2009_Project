@@ -3,7 +3,7 @@ import csv
 import os
 import time
 from collections import deque
-from typing import Optional
+from typing import Optional, Tuple
 
 import adafruit_dht
 import board
@@ -28,16 +28,25 @@ MIN_BPM = 40
 MAX_BPM = 200
 INTERVAL_WINDOW = 6
 
-# Expected CSV header — used for schema validation on append.
-# If an existing file's header doesn't match this list exactly, the script
-# will refuse to append rather than silently produce misaligned rows.
+REFRACTORY_S = 0.45       # minimum time between beats
+BEAT_BUF_LEN = 25         # short IR history for beat detection
+MIN_PROMINENCE = 150.0    # minimum dip depth
+FINGER_PRESENT_IR = 1000  # accepts both ~1200 and ~120k style readings
+
+# SpO2 estimation config
+SPO2_MIN = 70.0
+SPO2_MAX = 100.0
+
+# Expected CSV header used for schema validation on append.
 EXPECTED_HEADER = [
     "timestamp",
+    "red_raw",
     "ir_raw",
     "ac_dc_ratio",
     "peak_to_peak",
     "t_room",
     "hr",
+    "spo2_est",
     "hr_std_5s",
     "ir_std_5s",
     "ir_slope",
@@ -63,13 +72,14 @@ def setup_max30102(bus: SMBus) -> None:
     bus.write_byte_data(I2C_ADDR, 0x0A, 0x27)   # Pulse width
 
 
-def read_ir(bus: SMBus) -> Optional[int]:
+def read_red_ir(bus: SMBus) -> Tuple[Optional[int], Optional[int]]:
     try:
         d = bus.read_i2c_block_data(I2C_ADDR, 0x07, 6)
+        red = ((d[0] << 16) | (d[1] << 8) | d[2]) & 0x03FFFF
         ir = ((d[3] << 16) | (d[4] << 8) | d[5]) & 0x03FFFF
-        return ir
+        return red, ir
     except Exception:
-        return None
+        return None, None
 
 
 # -- Feature helpers ------------------------------------------------------------
@@ -109,6 +119,35 @@ def ac_dc_ratio(window) -> float:
 def peak_to_peak(window) -> float:
     vals = [float(v) for v in window if v is not None and np.isfinite(v)]
     return float(np.max(vals) - np.min(vals)) if vals else 0.0
+
+
+def estimate_spo2(red_window, ir_window) -> Optional[float]:
+    red_vals = np.array(
+        [float(v) for v in red_window if v is not None and np.isfinite(v)],
+        dtype=float
+    )
+    ir_vals = np.array(
+        [float(v) for v in ir_window if v is not None and np.isfinite(v)],
+        dtype=float
+    )
+
+    if len(red_vals) < 10 or len(ir_vals) < 10:
+        return None
+
+    dc_red = float(np.mean(red_vals))
+    dc_ir = float(np.mean(ir_vals))
+    ac_red = float(np.max(red_vals) - np.min(red_vals))
+    ac_ir = float(np.max(ir_vals) - np.min(ir_vals))
+
+    if dc_red <= 0 or dc_ir <= 0 or ac_ir <= 0:
+        return None
+
+    ratio_r = (ac_red / (dc_red + 1e-6)) / (ac_ir / (dc_ir + 1e-6))
+
+    # Simple prototype approximation, not medical-grade calibration
+    spo2 = 110.0 - 25.0 * ratio_r
+    spo2 = max(SPO2_MIN, min(SPO2_MAX, spo2))
+    return float(spo2)
 
 
 class ContextBuffer:
@@ -163,23 +202,18 @@ class ContextBuffer:
             "p2p_cv": float(p2p_mean / (ir_mean + 1e-6)) if ir_mean > 0.0 else 0.0,
         }
 
-
 # -- Main -----------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--label",
         required=True,
-        # FIX: Simplified to canonical label names only.
-        # Legacy variants (good_contact_normal_room, good_contact_cold_room)
-        # have been removed from the CLI to match what train_contact_classifier.py
-        # expects after normalisation. This prevents confusion where the user
-        # records under a legacy name and the file is silently remapped.
         choices=[
             "good_contact",
             "finger_off",
             "poor_contact",
             "motion_artifact",
+            "cold_temp",
         ],
     )
     parser.add_argument("--duration", type=int, default=60, help="Recording duration in seconds")
@@ -190,10 +224,6 @@ def main() -> None:
     outfile = os.path.join(OUTPUT_DIR, f"{label}.csv")
     is_new = not os.path.exists(outfile)
 
-    # FIX: Schema validation on append.
-    # If an existing CSV was written with an older column layout, appending new
-    # rows would silently misalign data (e.g. a value for 'ir_raw' landing in
-    # the 'ac_dc_ratio' column). This check catches that before any data is lost.
     if not is_new:
         with open(outfile, "r", newline="") as check_f:
             existing_header = check_f.readline().strip().split(",")
@@ -210,13 +240,14 @@ def main() -> None:
     print(f"[LOG] Recording '{label}' for {duration}s -> {outfile}")
     print("[LOG] Press Ctrl+C to stop early.\n")
 
-    ppg_buf = deque(maxlen=PPG_WINDOW)
+    ir_ppg_buf = deque(maxlen=PPG_WINDOW)
+    red_ppg_buf = deque(maxlen=PPG_WINDOW)
     context = ContextBuffer(window_seconds=CONTEXT_WINDOW_SECONDS)
     t_room = None
     rows = 0
 
     # HR estimation state
-    ir_history = []
+    beat_buf = deque(maxlen=BEAT_BUF_LEN)
     last_beat_time = None
     intervals = deque(maxlen=INTERVAL_WINDOW)
     bpm = None
@@ -228,11 +259,6 @@ def main() -> None:
 
         setup_max30102(bus)
         end_time = time.time() + duration
-        # NOTE: DHT22 is polled at most once every 2 seconds (per sensor spec).
-        # This means most CSV rows will have t_room="" (empty/NaN). This is
-        # intentional — pandas read_csv will convert empty strings to NaN, and
-        # the imputer fills them correctly during training. Do NOT poll faster;
-        # the DHT22 will return stale or error values if read more frequently.
         last_dht = 0.0
         period = 1.0 / SAMPLE_HZ
 
@@ -249,26 +275,41 @@ def main() -> None:
                         pass
                     last_dht = loop_start
 
-                ir = read_ir(bus)
-                if ir is not None:
-                    ppg_buf.append(float(ir))
+                red, ir = read_red_ir(bus)
 
-                    # same simple HR logic used in runtime
-                    if 50000 < ir < 200000:
-                        ir_history.append(ir)
-                        if len(ir_history) > 30:
-                            ir_history.pop(0)
-                        avg = sum(ir_history) / len(ir_history)
-                        if ir < (avg - 500):
-                            if last_beat_time is None or (loop_start - last_beat_time) > 0.45:
+                if ir is not None:
+                    ir_ppg_buf.append(float(ir))
+                if red is not None:
+                    red_ppg_buf.append(float(red))
+
+                if ir is not None:
+                    # HR uses IR channel
+                    if ir > FINGER_PRESENT_IR:
+                        beat_buf.append(float(ir))
+
+                        if len(beat_buf) >= 3:
+                            prev_v = beat_buf[-3]
+                            curr_v = beat_buf[-2]
+                            next_v = beat_buf[-1]
+
+                            mean_v = float(np.mean(beat_buf))
+                            std_v = float(np.std(beat_buf))
+                            prominence = max(MIN_PROMINENCE, 0.8 * std_v)
+
+                            is_local_min = (curr_v < prev_v) and (curr_v < next_v)
+                            deep_enough = (mean_v - curr_v) > prominence
+                            far_enough = (last_beat_time is None) or ((loop_start - last_beat_time) > REFRACTORY_S)
+
+                            if is_local_min and deep_enough and far_enough:
                                 if last_beat_time is not None:
                                     interval = loop_start - last_beat_time
-                                    inst = 60.0 / interval if interval > 0 else None
-                                    if inst and (MIN_BPM <= inst <= MAX_BPM):
+                                    inst_bpm = 60.0 / interval if interval > 0 else None
+                                    if inst_bpm is not None and (MIN_BPM <= inst_bpm <= MAX_BPM):
                                         intervals.append(interval)
+                                        bpm = 60.0 / (sum(intervals) / len(intervals))
                                 last_beat_time = loop_start
                     else:
-                        ir_history = []
+                        beat_buf.clear()
                         last_beat_time = None
                         intervals.clear()
                         bpm = None
@@ -276,9 +317,16 @@ def main() -> None:
                 if len(intervals) >= 2:
                     bpm = 60.0 / (sum(intervals) / len(intervals))
 
-                window = list(ppg_buf)
-                adc_r = ac_dc_ratio(window)
-                p2p = peak_to_peak(window)
+                ir_window = list(ir_ppg_buf)
+                red_window = list(red_ppg_buf)
+
+                adc_r = ac_dc_ratio(ir_window)
+                p2p = peak_to_peak(ir_window)
+
+                # Only estimate SpO2 when both channels have enough data and a finger is likely present
+                spo2_est = None
+                if ir is not None and red is not None and ir > FINGER_PRESENT_IR:
+                    spo2_est = estimate_spo2(red_window, ir_window)
 
                 context.update(
                     now=loop_start,
@@ -292,11 +340,13 @@ def main() -> None:
 
                 writer.writerow([
                     round(loop_start, 4),
+                    red if red is not None else "",
                     ir if ir is not None else "",
                     round(adc_r, 6),
                     round(p2p, 2),
                     round(t_room, 2) if t_room is not None else "",
                     round(bpm, 2) if bpm is not None else "",
+                    round(spo2_est, 2) if spo2_est is not None else "",
                     round(ctx["hr_std_5s"], 6),
                     round(ctx["ir_std_5s"], 6),
                     round(ctx["ir_slope"], 6),
