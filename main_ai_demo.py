@@ -12,31 +12,49 @@ from typing import Optional
 
 from mqtt_publisher import init_mqtt, publish_vitals, stop_mqtt
 
-import adafruit_dht
-import board
 import joblib
 import numpy as np
 import pandas as pd
+
+# ==============================================================================
+# Hardware imports
+# GPIO (LEDs + buzzer) is always imported — it works in both real and demo mode.
+# Only the sensor-specific libraries (adafruit_dht, smbus2) are stubbed out
+# in DEMO_MODE since they require physical wiring.
+# ==============================================================================
+_DEMO_MODE_EARLY = True   # must match DEMO_MODE in CONFIGURATION block below
+
 from gpiozero import Device, LED, PWMOutputDevice
 from gpiozero.pins.lgpio import LGPIOFactory
 from smbus2 import SMBus
 
 Device.pin_factory = LGPIOFactory()
 
-# -- GPIO -----------------------------------------------------------------------
+# LEDs and buzzer — always real, work in both modes
 led_green  = LED(17)
 led_yellow = LED(27)
 led_red    = LED(22)
 buzzer     = PWMOutputDevice(23)
 
-# -- DHT22 ----------------------------------------------------------------------
-dht = adafruit_dht.DHT22(board.D4, use_pulseio=False)
+if not _DEMO_MODE_EARLY:
+    # Real sensor hardware — only needed when reading from the actual sensor
+    import adafruit_dht
+    import board
+    dht = adafruit_dht.DHT22(board.D4, use_pulseio=False)
+else:
+    # Stub for DHT22 only — temperature comes from the CSV in demo mode
+    class _DHTStub:
+        temperature = None
+        def exit(self): pass
+    dht = _DHTStub()
 
 # -- MAX30102 -------------------------------------------------------------------
 I2C_ADDR = 0x57
 
 
-def setup_max30102(bus: SMBus) -> None:
+def setup_max30102(bus) -> None:
+    if bus is None:
+        return   # demo mode — no hardware
     bus.write_byte_data(I2C_ADDR, 0x09, 0x40)
     time.sleep(0.1)
     bus.write_byte_data(I2C_ADDR, 0x09, 0x03)
@@ -114,6 +132,16 @@ EVAL_LOGGING  = True
 EVAL_LOG_FILE = "eval_log.csv"
 EVAL_LOG_S    = 1.0
 
+# ==============================================================================
+# DEMO MODE — set DEMO_MODE = True to feed sensor data from a CSV file instead
+# of the real MAX30102 / DHT22 hardware. The AI pipeline, MQTT publish, and all
+# logging run completely unchanged; only the sensor read block is bypassed.
+# ==============================================================================
+DEMO_MODE      = True                        # <- flip to False for real sensor
+DEMO_CSV_FILE  = "anomaly_demo_dataset.csv"  # generated dataset
+DEMO_SPEED     = 1.0                         # 1.0 = real-time, 2.0 = 2x faster
+DEMO_LOOP      = True                        # restart from beginning when done
+
 # --- Dashboard logging (comprehensive sensor + AI state)
 DASHBOARD_LOGGING = True
 DASHBOARD_LOG_FILE = "dashboard_log.csv"
@@ -123,6 +151,39 @@ DASHBOARD_LOG_S = 0.1  # 10Hz dashboard updates
 # ==============================================================================
 # Helpers
 # ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Demo CSV iterator — yields (ir, red, amb_t, scenario) one row per call.
+# Runs at DEMO_SPEED x real-time by sleeping between rows.
+# ------------------------------------------------------------------------------
+def _make_demo_iterator(csv_path: str, speed: float, loop: bool):
+    """Generator: yields (ir, red, amb_t, scenario) from the demo CSV."""
+    import csv as _csv
+    while True:
+        try:
+            with open(csv_path, newline="") as f:
+                rows = list(_csv.DictReader(f))
+        except FileNotFoundError:
+            print(f"[DEMO] ERROR: {csv_path} not found. "
+                  "Run the dataset generator first.")
+            raise SystemExit(1)
+
+        dt = 0.1 / speed   # seconds per row (dataset is 10 Hz)
+        for row in rows:
+            t0 = time.perf_counter()
+            ir_v     = int(float(row["ir_raw"]))  if row["ir_raw"]  else None
+            red_v    = int(float(row["red_raw"])) if row["red_raw"] else None
+            amb_t_v  = float(row["amb_t"])        if row["amb_t"]   else None
+            scenario = row.get("scenario", "")
+            yield ir_v, red_v, amb_t_v, scenario
+            elapsed = time.perf_counter() - t0
+            time.sleep(max(0.0, dt - elapsed))
+
+        if not loop:
+            return
+        print("[DEMO] Dataset complete — looping back to start.")
+
+
 def load_joblib_model(path: str):
     if not os.path.exists(path):
         return None
@@ -687,8 +748,18 @@ _prof_t_s2_ms     = 0.0
 PROF_REPORT_EVERY = 100
 
 try:
-    with SMBus(1) as bus:
+    # In DEMO_MODE we skip all hardware init. A dummy bus object is used
+    # so the rest of the indented block stays structurally identical.
+    if DEMO_MODE:
+        print(f"[DEMO] Mode active — reading from {DEMO_CSV_FILE} at {DEMO_SPEED}x speed.")
+        print(f"[DEMO] AI pipeline, MQTT, and logging run as normal.")
+        _demo_iter = _make_demo_iterator(DEMO_CSV_FILE, DEMO_SPEED, DEMO_LOOP)
+        bus = None   # not used in demo mode
+    else:
+        bus = SMBus(1)
         setup_max30102(bus)
+
+    if True:   # keeps indentation identical to the original `with SMBus(1) as bus:` block
 
         ir_buf      = deque(maxlen=PPG_WINDOW)
         red_buf     = deque(maxlen=PPG_WINDOW)
@@ -724,19 +795,42 @@ try:
         prev_contact_status = "UNKNOWN"
         signal_present      = False
         contact_good_since  = None
+        _last_demo_scenario = None   # for DEMO_MODE scenario transition printing
 
         while True:
             loop_start = time.time()
 
-            # ----------- 1) Read MAX30102 ------------------------------------
+            # ----------- 1) Read sensor (or demo CSV) ------------------------
             read_t0 = time.time()
             ir = None
             red = None
-            try:
-                d   = bus.read_i2c_block_data(I2C_ADDR, 0x07, 6)
-                red = ((d[0] << 16) | (d[1] << 8) | d[2]) & 0x03FFFF
-                ir  = ((d[3] << 16) | (d[4] << 8) | d[5]) & 0x03FFFF
 
+            if DEMO_MODE:
+                # Pull next row from CSV iterator — timing is handled inside
+                try:
+                    ir, red, _demo_amb_t, _demo_scenario = next(_demo_iter)
+                    if _demo_amb_t is not None:
+                        # Inject temperature directly (bypasses DHT22 thread)
+                        with _dht_lock:
+                            _dht_value = _demo_amb_t
+                    # Print scenario transitions
+                    if _demo_scenario != _last_demo_scenario:
+                        print(f"\n[DEMO] >>> Scenario: {_demo_scenario.upper()} <<<")
+                        _last_demo_scenario = _demo_scenario
+                except StopIteration:
+                    print("\n[DEMO] Dataset finished.")
+                    raise KeyboardInterrupt
+            else:
+                # Real MAX30102 sensor read
+                try:
+                    d   = bus.read_i2c_block_data(I2C_ADDR, 0x07, 6)
+                    red = ((d[0] << 16) | (d[1] << 8) | d[2]) & 0x03FFFF
+                    ir  = ((d[3] << 16) | (d[4] << 8) | d[5]) & 0x03FFFF
+                except Exception:
+                    pass
+
+            # Shared buffer append + beat detection (same for both modes)
+            if ir is not None and red is not None:
                 ir_buf.append(float(ir))
                 red_buf.append(float(red))
 
@@ -785,9 +879,6 @@ try:
                         spo2_buf.clear()
                         acdc_buf.clear()
                         p2p_buf.clear()
-
-            except Exception:
-                pass
 
             read_latency_ms = (time.time() - read_t0) * 1000.0
 
@@ -844,7 +935,8 @@ try:
 
             # ----------- 3) HR print (periodic only) ----------------------------------
             if bpm is not None and (loop_start - last_hr_print) >= HR_PRINT_S:
-                print(f"[HR] {bpm:.1f} BPM | [SPO2] {spo2_est:.1f}% (est) | [IR] {ir if ir else 'N/A'} | [RED] {red if red else 'N/A'}")
+                _spo2_str = f"{spo2_est:.1f}%" if spo2_est is not None else "N/A"
+                print(f"[HR] {bpm:.1f} BPM | [SPO2] {_spo2_str} (est) | [IR] {ir if ir else 'N/A'} | [RED] {red if red else 'N/A'}")
                 last_hr_print = loop_start
 
             # ----- 4) AI 2-stage pipeline -----------------------------------
@@ -1117,19 +1209,23 @@ try:
                 _prof_t_s1_ms   = 0.0
                 _prof_t_s2_ms   = 0.0
 
-            time.sleep(0.02)
+            # In real sensor mode sleep 20ms between reads.
+            # In demo mode the CSV iterator already handles row timing.
+            if not DEMO_MODE:
+                time.sleep(0.02)
 
 except KeyboardInterrupt:
     print("\n[EXIT] Shutdown.")
 finally:
-    all_leds_off()
+    all_leds_off()   # always safe — real hardware in both modes now
     buzzer.off()
     stop_mqtt()
     if _eval_file_h:
         _eval_file_h.close()
     if _dashboard_file_h:
         _dashboard_file_h.close()
-    try:
-        dht.exit()
-    except Exception:
-        pass
+    if not DEMO_MODE:
+        try:
+            dht.exit()
+        except Exception:
+            pass

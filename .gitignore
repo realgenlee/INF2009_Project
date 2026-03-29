@@ -9,5 +9,7 @@ proj_env/
 # old / unused stuff
 training_data(old)/
 main_ai_optimized1.py
+main_ai_scheduling.py
+main_ai_v4.py
 dashboard_log.csv
 eval_log.csv
